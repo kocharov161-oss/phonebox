@@ -1,0 +1,75 @@
+name: PhoneBox iOS device IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  device:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # upstream v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+          brew install xcodegen
+      - name: Generate project and build unsigned iPhone app
+        working-directory: ios/PhoneBox
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild \
+            -project PhoneBox.xcodeproj \
+            -scheme PhoneBox \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build-device \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build
+      - name: Run upstream pairing and proxy tests
+        run: swift test --package-path ios/PhoneBox/PhoneBoxKit
+      - name: Verify iPhone binary and bundled panel
+        working-directory: ios/PhoneBox
+        run: |
+          set -euo pipefail
+          app=build-device/Build/Products/Release-iphoneos/PhoneBox.app
+          for f in Info.plist PanelShim.js www/index.html www/main.js www/widgets/basic.js www/style.css; do
+            test -s "$app/$f"
+          done
+          plutil -lint "$app/Info.plist"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
+          test -f "$app/$executable"
+          test "$(lipo -archs "$app/$executable")" = arm64
+          xcrun vtool -show-build "$app/$executable" | tee "$RUNNER_TEMP/phonebox-platform.txt"
+          grep -Eq '^[[:space:]]*platform[[:space:]]+IOS[[:space:]]*$' "$RUNNER_TEMP/phonebox-platform.txt"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")" = net.oxog.phonebox.ios
+          test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist")" = 16.0
+          diff -qr -x .DS_Store ../../android/app/src/main/assets/www "$app/www"
+      - name: Package unsigned IPA
+        working-directory: ios/PhoneBox
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/phonebox-ipa"
+          output="$GITHUB_WORKSPACE/ipa-output"
+          mkdir -p "$stage/Payload" "$output"
+          ditto build-device/Build/Products/Release-iphoneos/PhoneBox.app "$stage/Payload/PhoneBox.app"
+          (cd "$stage" && /usr/bin/zip -qry "$output/PhoneBox.ipa" Payload)
+          unzip -t "$output/PhoneBox.ipa"
+          unzip -Z1 "$output/PhoneBox.ipa" | grep -Fx 'Payload/PhoneBox.app/Info.plist'
+          (cd "$output" && shasum -a 256 PhoneBox.ipa > SHA256SUMS)
+          printf 'Source commit: %s\nUnsigned device build; requires local signing before installation.\n' "$GITHUB_SHA" > "$output/BUILD-INFO.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # upstream v7.0.2
+        with:
+          name: phonebox-ios-device-unsigned
+          path: ipa-output/
+          if-no-files-found: error
+          retention-days: 7
